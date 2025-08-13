@@ -1,0 +1,6 @@
+{
+  "host": "0.0.0.0",
+  "port": 5000,
+  "public_host": "example.com",
+  "public_port": 5000
+}
