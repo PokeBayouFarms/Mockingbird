@@ -1,0 +1,18 @@
+[Unit]
+Description=Gunicorn instance to serve Mockingbird
+After=network.target
+
+[Service]
+# Replace 'youruser' with the non-root user you are deploying with
+User=youruser
+Group=www-data
+
+# Replace 'youruser' with your actual username
+WorkingDirectory=/home/youruser/mockingbird
+Environment="PATH=/home/youruser/mockingbird/venv/bin"
+ExecStart=/home/youruser/mockingbird/venv/bin/gunicorn --workers 3 --bind unix:mockingbird.sock -m 007 server:app
+
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
