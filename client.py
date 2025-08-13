@@ -1,18 +1,12 @@
-import os
-import json
-import base64
-import pyotp
-import keyring
-import tkinter as tk
+import os, json, base64, queue, threading, tkinter as tk
 from tkinter import messagebox, ttk
+import pyotp, keyring, qrcode, requests
 from PIL import Image, ImageTk
-import qrcode
-import requests
-import threading
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 
 CONFIG_FILE = "config.json"
@@ -21,383 +15,334 @@ ENCRYPTED_KEY_FILE = "private_key.enc"
 TOTP_KEYRING_SERVICE = "Mockingbird_TOTP"
 ISSUER_NAME = "Mockingbird"
 
-# ---------------- Encryption / Signing Helpers ----------------
-def derive_key(password, salt):
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=100_000,
-        backend=default_backend()
-    )
-    return kdf.derive(password.encode())
+class CryptoManager:
+    def derive_key(self, password: str, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=300_000, backend=default_backend())
+        return kdf.derive(password.encode())
+    def encrypt_private_key(self, key_bytes: bytes, password: str) -> bytes:
+        salt = os.urandom(16)
+        derived_key = self.derive_key(password, salt)
+        iv = os.urandom(12)
+        cipher = Cipher(algorithms.AES(derived_key), modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(key_bytes) + encryptor.finalize()
+        return salt + iv + encryptor.tag + ciphertext
+    def decrypt_private_key(self, encrypted_data: bytes, password: str) -> bytes:
+        salt, iv, tag, ciphertext = encrypted_data[:16], encrypted_data[16:28], encrypted_data[28:44], encrypted_data[44:]
+        derived_key = self.derive_key(password, salt)
+        cipher = Cipher(algorithms.AES(derived_key), modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        return decryptor.update(ciphertext) + decryptor.finalize()
+    def aes_gcm_encrypt(self, message: bytes, key: bytes) -> bytes:
+        iv = os.urandom(12)
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(message) + encryptor.finalize()
+        return iv + encryptor.tag + ciphertext
+    def aes_gcm_decrypt(self, encrypted_message: bytes, key: bytes) -> bytes:
+        iv, tag, ciphertext = encrypted_message[:12], encrypted_message[12:28], encrypted_message[28:]
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag))
+        decryptor = cipher.decryptor()
+        return decryptor.update(ciphertext) + decryptor.finalize()
+    def encrypt_for_recipient(self, message_bytes: bytes, recipient_pub_bytes: bytes) -> (str, str):
+        pub_key = serialization.load_pem_public_key(recipient_pub_bytes)
+        session_key = os.urandom(32)
+        encrypted_msg = self.aes_gcm_encrypt(message_bytes, session_key)
+        encrypted_key = pub_key.encrypt(session_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        return base64.b64encode(encrypted_key).decode(), base64.b64encode(encrypted_msg).decode()
+    def decrypt_from_sender(self, encrypted_key_b64: str, encrypted_msg_b64: str, private_key_bytes: bytes) -> bytes:
+        private_key = serialization.load_pem_private_key(private_key_bytes, password=None)
+        session_key = private_key.decrypt(base64.b64decode(encrypted_key_b64), padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        return self.aes_gcm_decrypt(base64.b64decode(encrypted_msg_b64), session_key)
+    def sign_message(self, private_key_bytes: bytes, message_bytes: bytes) -> str:
+        private_key = serialization.load_pem_private_key(private_key_bytes, password=None)
+        signature = private_key.sign(message_bytes, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+        return base64.b64encode(signature).decode()
+    def verify_signature(self, public_key_bytes: bytes, message_bytes: bytes, signature_b64: str) -> bool:
+        public_key = serialization.load_pem_public_key(public_key_bytes)
+        try:
+            public_key.verify(base64.b64decode(signature_b64), message_bytes, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+            return True
+        except Exception:
+            return False
 
-def encrypt_data(data, key):
-    iv = os.urandom(16)
-    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    return iv + encryptor.update(data) + encryptor.finalize()
+class ApiClient:
+    def __init__(self, server_url: str):
+        self.base_url = f"https://{server_url}" if not server_url.startswith("https://") else server_url
+    def register(self, username: str, public_key_b64: str) -> dict:
+        return requests.post(f"{self.base_url}/register", json={"username": username, "public_key": public_key_b64}, timeout=10).json()
+    def get_clients(self) -> dict:
+        return requests.get(f"{self.base_url}/clients", timeout=10).json()
+    def send_message(self, payload: dict) -> dict:
+        return requests.post(f"{self.base_url}/send", json=payload, timeout=15).json()
+    def get_inbox(self, username: str) -> list:
+        return requests.get(f"{self.base_url}/inbox/{username}", timeout=15).json()
 
-def decrypt_data(data, key):
-    iv = data[:16]
-    ct = data[16:]
-    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    return decryptor.update(ct) + decryptor.finalize()
+class SetupPopup(tk.Toplevel):
+    def __init__(self, parent, crypto: CryptoManager):
+        super().__init__(parent)
+        self.transient(parent)
+        self.grab_set()
+        self.title("First Time Setup")
+        self.crypto = crypto
+        self.result = None
+        tk.Label(self, text="Create Username:").pack(pady=5)
+        self.username_entry = tk.Entry(self)
+        self.username_entry.pack(padx=10)
+        tk.Label(self, text="Create Password:").pack(pady=5)
+        self.pw_entry = tk.Entry(self, show="*")
+        self.pw_entry.pack(padx=10)
+        self.qr_label = tk.Label(self)
+        self.qr_label.pack(pady=10)
+        tk.Button(self, text="Complete Setup", command=self.do_setup).pack(pady=10)
+        self.wait_window()
+    def do_setup(self):
+        username = self.username_entry.get().strip()
+        password = self.pw_entry.get()
+        if not username or not password:
+            messagebox.showwarning("Input Required", "Username and password cannot be empty.", parent=self)
+            return
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        private_key_bytes = private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption())
+        public_key_bytes = private_key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        with open(PUBLIC_KEY_FILE, "wb") as f: f.write(public_key_bytes)
+        encrypted_pk = self.crypto.encrypt_private_key(private_key_bytes, password)
+        with open(ENCRYPTED_KEY_FILE, "wb") as f: f.write(encrypted_pk)
+        totp_secret = pyotp.random_base32()
+        keyring.set_password(TOTP_KEYRING_SERVICE, username, totp_secret)
+        with open(CONFIG_FILE, "w") as f: json.dump({"account_name": username, "issuer_name": ISSUER_NAME}, f)
+        uri = pyotp.TOTP(totp_secret).provisioning_uri(name=username, issuer_name=ISSUER_NAME)
+        qr_img = qrcode.make(uri).resize((250, 250))
+        self.qr_photo = ImageTk.PhotoImage(qr_img)
+        self.qr_label.config(image=self.qr_photo)
+        messagebox.showinfo("Scan QR Code", "Scan the QR code with your authenticator app, then close this setup window.", parent=self)
+        self.result = {"username": username, "private_key": private_key_bytes}
+        self.destroy()
 
-def aes_encrypt(message, key):
-    iv = os.urandom(16)
-    cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
-    encryptor = cipher.encryptor()
-    ct = encryptor.update(message) + encryptor.finalize()
-    return iv + ct
+class UnlockPopup(tk.Toplevel):
+    def __init__(self, parent, crypto: CryptoManager, username: str):
+        super().__init__(parent)
+        self.transient(parent)
+        self.grab_set()
+        self.title("Unlock")
+        self.crypto = crypto
+        self.username = username
+        self.result = None
+        tk.Label(self, text="Enter Password:").pack(pady=5)
+        self.pw_entry = tk.Entry(self, show="*")
+        self.pw_entry.pack(padx=10)
+        tk.Label(self, text="Enter TOTP Code:").pack(pady=5)
+        self.totp_entry = tk.Entry(self)
+        self.totp_entry.pack(padx=10)
+        tk.Button(self, text="Unlock", command=self.do_unlock).pack(pady=10)
+        self.wait_window()
+    def do_unlock(self):
+        password = self.pw_entry.get()
+        totp_code = self.totp_entry.get().strip()
+        totp_secret = keyring.get_password(TOTP_KEYRING_SERVICE, self.username)
+        if not totp_secret or not pyotp.TOTP(totp_secret).verify(totp_code):
+            messagebox.showerror("Auth Failed", "Invalid TOTP code.", parent=self)
+            return
+        try:
+            with open(ENCRYPTED_KEY_FILE, "rb") as f: encrypted_data = f.read()
+            private_key_bytes = self.crypto.decrypt_private_key(encrypted_data, password)
+            self.result = {"private_key": private_key_bytes}
+            self.destroy()
+        except InvalidTag:
+            messagebox.showerror("Auth Failed", "Decryption failed. Incorrect password or corrupted key file.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Error", "An unexpected error occurred during decryption.", parent=self)
 
-def aes_decrypt(ciphertext, key):
-    iv = ciphertext[:16]
-    ct = ciphertext[16:]
-    cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
-    decryptor = cipher.decryptor()
-    return decryptor.update(ct) + decryptor.finalize()
-
-def encrypt_for_recipient(message_bytes, recipient_pub_bytes):
-    pub_key = serialization.load_pem_public_key(recipient_pub_bytes)
-    session_key = os.urandom(32)
-    encrypted_msg = aes_encrypt(message_bytes, session_key)
-    encrypted_key = pub_key.encrypt(
-        session_key,
-        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                     algorithm=hashes.SHA256(),
-                     label=None)
-    )
-    return base64.b64encode(encrypted_key).decode(), base64.b64encode(encrypted_msg).decode()
-
-def decrypt_from_sender(encrypted_key_b64, encrypted_msg_b64, private_key_bytes):
-    private_key = serialization.load_pem_private_key(private_key_bytes, password=None)
-    encrypted_key = base64.b64decode(encrypted_key_b64)
-    ciphertext = base64.b64decode(encrypted_msg_b64)
-    session_key = private_key.decrypt(
-        encrypted_key,
-        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                     algorithm=hashes.SHA256(),
-                     label=None)
-    )
-    return aes_decrypt(ciphertext, session_key)
-
-def sign_message(private_key_bytes, message_bytes):
-    private_key = serialization.load_pem_private_key(private_key_bytes, password=None)
-    signature = private_key.sign(
-        message_bytes,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH
-        ),
-        hashes.SHA256()
-    )
-    return base64.b64encode(signature).decode()
-
-def verify_signature(public_key_bytes, message_bytes, signature_b64):
-    public_key = serialization.load_pem_public_key(public_key_bytes)
-    try:
-        public_key.verify(
-            base64.b64decode(signature_b64),
-            message_bytes,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return True
-    except Exception:
-        return False
-
-# ---------------- GUI ----------------
 class SecureApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.withdraw()  # Hide main window until setup/unlock complete
-
-        self.private_key_bytes = None
+        self.withdraw()
+        self.crypto = CryptoManager()
+        self.api_client = None
         self.username = None
-        self.server_url = None
-        self.first_run_success = False
-
-        self.check_first_run()  # Blocks until done
-
-        if not self.first_run_success:
+        self.private_key_bytes = None
+        self.config = self.load_config()
+        self.gui_queue = queue.Queue()
+        if self.run_startup_flow():
+            self.create_main_window()
+            self.after(100, self.process_queue)
+            self.deiconify()
+        else:
             self.destroy()
-            return
-
-        self.deiconify()
-        self.title("Mockingbird Messaging App")
-        self.geometry("650x800")
-        self.resizable(False, False)
-
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    def save_config(self):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config, f, indent=4)
+    def run_startup_flow(self) -> bool:
+        if not os.path.exists(ENCRYPTED_KEY_FILE):
+            popup = SetupPopup(self, self.crypto)
+            if popup.result:
+                self.username = popup.result["username"]
+                self.private_key_bytes = popup.result["private_key"]
+                self.config["account_name"] = self.username
+                self.save_config()
+                return True
+        else:
+            self.username = self.config.get("account_name")
+            if not self.username:
+                messagebox.showerror("Config Error", "Username not found in config. Cannot unlock.")
+                return False
+            popup = UnlockPopup(self, self.crypto, self.username)
+            if popup.result:
+                self.private_key_bytes = popup.result["private_key"]
+                return True
+        return False
+    def create_main_window(self):
+        self.title(f"Mockingbird Secure Messenger - {self.username}")
+        self.geometry("700x800")
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(expand=True, fill="both")
-
+        self.notebook.pack(expand=True, fill="both", padx=10, pady=10)
         self.messaging_frame = ttk.Frame(self.notebook)
         self.server_frame = ttk.Frame(self.notebook)
-
         self.notebook.add(self.messaging_frame, text="Messaging")
-        self.notebook.add(self.server_frame, text="Server")
-
+        self.notebook.add(self.server_frame, text="Server & Users")
         self.setup_server_tab()
         self.setup_messaging_tab()
-
-    # ---------------- First Run / Unlock ----------------
-    def check_first_run(self):
-        if not os.path.exists(ENCRYPTED_KEY_FILE):
-            self.first_run_setup()
-        else:
-            self.unlock_popup()
-
-    def first_run_setup(self):
-        popup = tk.Toplevel()
-        popup.title("First Time Setup")
-        popup.grab_set()
-        tk.Label(popup, text="=== First Time Setup ===", font=("Arial", 14)).pack(pady=5)
-
-        tk.Label(popup, text="Create username:").pack()
-        username_entry = tk.Entry(popup)
-        username_entry.pack(pady=5)
-
-        tk.Label(popup, text="Create password:").pack()
-        pw_entry = tk.Entry(popup, show="*")
-        pw_entry.pack(pady=5)
-
-        def do_setup():
-            username = username_entry.get().strip()
-            password = pw_entry.get()
-            if not username or not password:
-                messagebox.showwarning("Warning", "Both fields are required")
-                return
-            self.username = username
-
-            # RSA key
-            private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-            self.private_key_bytes = private_key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL,
-                serialization.NoEncryption()
-            )
-            public_bytes = private_key.public_key().public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-            with open(PUBLIC_KEY_FILE, "wb") as f:
-                f.write(public_bytes)
-
-            # Encrypt private key
-            salt = os.urandom(16)
-            key_bytes = derive_key(password, salt)
-            enc_private = encrypt_data(self.private_key_bytes, key_bytes)
-            with open(ENCRYPTED_KEY_FILE, "wb") as f:
-                f.write(salt + enc_private)
-
-            # TOTP
-            totp_secret = pyotp.random_base32()
-            keyring.set_password(TOTP_KEYRING_SERVICE, "user_totp", totp_secret)
-            config = {"account_name": self.username, "issuer_name": ISSUER_NAME}
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(config, f)
-
-            # QR code
-            uri = pyotp.TOTP(totp_secret).provisioning_uri(name=self.username, issuer_name=ISSUER_NAME)
-            qr_img = qrcode.make(uri).resize((250, 250))
-            self.qr_photo = ImageTk.PhotoImage(qr_img)
-            qr_label = tk.Label(popup, image=self.qr_photo)
-            qr_label.pack(pady=10)
-
-            messagebox.showinfo("Setup Complete", "Scan the QR code in your authenticator app.")
-            self.first_run_success = True
-            popup.destroy()
-
-        tk.Button(popup, text="Setup", command=do_setup).pack(pady=5)
-        popup.wait_window()
-
-    def unlock_popup(self):
-        popup = tk.Toplevel()
-        popup.title("Unlock")
-        popup.grab_set()
-        tk.Label(popup, text="=== Unlock Private Key ===", font=("Arial", 14)).pack(pady=5)
-
-        tk.Label(popup, text="Password:").pack()
-        pw_entry = tk.Entry(popup, show="*")
-        pw_entry.pack(pady=5)
-
-        tk.Label(popup, text="TOTP code:").pack()
-        totp_entry = tk.Entry(popup)
-        totp_entry.pack(pady=5)
-
-        def do_unlock():
-            password = pw_entry.get()
-            totp_code = totp_entry.get()
-            totp_secret = keyring.get_password(TOTP_KEYRING_SERVICE, "user_totp")
-            if totp_secret is None:
-                messagebox.showerror("Error", "TOTP secret not found!")
-                return
-            totp = pyotp.TOTP(totp_secret)
-            if not totp.verify(totp_code):
-                messagebox.showerror("Error", "Invalid TOTP code!")
-                return
-            with open(ENCRYPTED_KEY_FILE, "rb") as f:
-                data = f.read()
-            salt, enc_private = data[:16], data[16:]
-            key_bytes = derive_key(password, salt)
-            try:
-                self.private_key_bytes = decrypt_data(enc_private, key_bytes)
-                with open(CONFIG_FILE, "r") as f:
-                    cfg = json.load(f)
-                    self.username = cfg.get("account_name", self.username)
-                self.first_run_success = True
-                popup.destroy()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to decrypt private key: {e}")
-
-        tk.Button(popup, text="Unlock", command=do_unlock).pack(pady=5)
-        popup.wait_window()
-
-    # ---------------- Server Tab ----------------
+        server_url = self.config.get("server_url", "")
+        if server_url:
+            self.api_client = ApiClient(server_url)
+            self.server_entry.insert(0, server_url)
+    def process_queue(self):
+        try:
+            while True:
+                callback, args = self.gui_queue.get_nowait()
+                callback(*args)
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self.process_queue)
     def setup_server_tab(self):
-        tk.Label(self.server_frame, text="Server hostname:").pack()
-        self.server_entry = tk.Entry(self.server_frame)
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                cfg = json.load(f)
-                self.server_url = cfg.get("server_url")
-                if self.server_url:
-                    self.server_entry.insert(0, self.server_url.replace("http://",""))
-        self.server_entry.pack(pady=5)
-
-        tk.Button(self.server_frame, text="Register / Reregister", command=self.register_to_server).pack(pady=5)
-        tk.Button(self.server_frame, text="Query Registered Users", command=self.query_recipients).pack(pady=5)
-
-        self.reregister_status = tk.Text(self.server_frame, height=10, width=70)
-        self.reregister_status.pack(pady=5)
-        self.clients_text = tk.Text(self.server_frame, height=15, width=70)
-        self.clients_text.pack(pady=5)
-
-    def register_to_server(self):
+        server_group = ttk.LabelFrame(self.server_frame, text="Server Configuration", padding=10)
+        server_group.pack(fill="x", padx=5, pady=5)
+        tk.Label(server_group, text="Server URL (e.g., my-server.com):").pack(anchor="w")
+        self.server_entry = tk.Entry(server_group, width=50)
+        self.server_entry.pack(fill="x", pady=5)
+        tk.Button(server_group, text="Set & Save Server", command=self.set_server).pack(pady=5)
+        reg_group = ttk.LabelFrame(self.server_frame, text="Registration", padding=10)
+        reg_group.pack(fill="x", padx=5, pady=5)
+        tk.Button(reg_group, text="Register This Client", command=self.register_client).pack(pady=5)
+        self.reg_status_text = tk.Text(reg_group, height=4, width=70)
+        self.reg_status_text.pack(pady=5)
+        user_group = ttk.LabelFrame(self.server_frame, text="Registered Users", padding=10)
+        user_group.pack(fill="both", expand=True, padx=5, pady=5)
+        tk.Button(user_group, text="Query Users", command=self.query_recipients).pack(pady=5)
+        self.clients_text = tk.Text(user_group, height=15, width=70)
+        self.clients_text.pack(fill="both", expand=True, pady=5)
+    def setup_messaging_tab(self):
+        send_group = ttk.LabelFrame(self.messaging_frame, text="Send Message", padding=10)
+        send_group.pack(fill="x", padx=5, pady=5)
+        tk.Label(send_group, text="Recipient Username:").pack(anchor="w")
+        self.recipient_entry = tk.Entry(send_group)
+        self.recipient_entry.pack(fill="x", pady=5)
+        tk.Label(send_group, text="Message:").pack(anchor="w")
+        self.msg_entry = tk.Text(send_group, height=5, width=50)
+        self.msg_entry.pack(fill="x", pady=5)
+        tk.Button(send_group, text="Send", command=self.send_message).pack(pady=5)
+        inbox_group = ttk.LabelFrame(self.messaging_frame, text="Inbox", padding=10)
+        inbox_group.pack(fill="both", expand=True, padx=5, pady=5)
+        tk.Button(inbox_group, text="Check Mailbox", command=self.refresh_inbox).pack(pady=5)
+        self.inbox_text = tk.Text(inbox_group, height=20, width=70)
+        self.inbox_text.pack(fill="both", expand=True, pady=5)
+    def set_server(self):
         server_host = self.server_entry.get().strip()
         if not server_host:
-            messagebox.showwarning("Warning", "Enter a server hostname")
+            messagebox.showwarning("Input Required", "Please enter a server URL.")
             return
-        server_url = f"http://{server_host}"
-        with open(PUBLIC_KEY_FILE, "rb") as f:
-            public_bytes = f.read()
-
-        def reg_thread():
+        self.api_client = ApiClient(server_host)
+        self.config["server_url"] = server_host
+        self.save_config()
+        messagebox.showinfo("Success", f"Server URL set to: {self.api_client.base_url}")
+    def _execute_in_thread(self, target_func, on_success, on_error):
+        if not self.api_client:
+            messagebox.showerror("Error", "Server URL not set. Please set it in the Server tab.")
+            return
+        def worker():
             try:
-                r = requests.post(f"{server_url}/register", json={
-                    "username": self.username,
-                    "public_key": base64.b64encode(public_bytes).decode()
-                })
-                self.reregister_status.insert(tk.END, f"{r.json()}\n")
-                self.reregister_status.see(tk.END)
+                result = target_func()
+                self.gui_queue.put((on_success, (result,)))
+            except requests.exceptions.RequestException as e:
+                self.gui_queue.put((on_error, (f"Network Error: {e}",)))
             except Exception as e:
-                self.reregister_status.insert(tk.END, f"Failed: {e}\n")
-                self.reregister_status.see(tk.END)
-
-        threading.Thread(target=reg_thread, daemon=True).start()
-
+                self.gui_queue.put((on_error, (f"An unexpected error occurred: {e}",)))
+        threading.Thread(target=worker, daemon=True).start()
+    def register_client(self):
+        def do_reg():
+            with open(PUBLIC_KEY_FILE, "rb") as f: pub_key_b64 = base64.b64encode(f.read()).decode()
+            return self.api_client.register(self.username, pub_key_b64)
+        def on_success(result): self.reg_status_text.insert(tk.END, f"Server response: {result}\n")
+        def on_error(error): self.reg_status_text.insert(tk.END, f"Failed: {error}\n")
+        self._execute_in_thread(do_reg, on_success, on_error)
     def query_recipients(self):
-        server_host = self.server_entry.get().strip()
-        server_url = f"http://{server_host}"
-        self.clients_text.delete("1.0", tk.END)
-
-        def fetch_thread():
-            try:
-                clients = requests.get(f"{server_url}/clients").json()
-                if clients:
-                    for user in clients.keys():
-                        self.clients_text.insert(tk.END, f"- {user}\n")
-                else:
-                    self.clients_text.insert(tk.END, "No users registered.\n")
-            except Exception as e:
-                self.clients_text.insert(tk.END, f"Failed: {e}\n")
-
-        threading.Thread(target=fetch_thread, daemon=True).start()
-
-    # ---------------- Messaging Tab ----------------
-    def setup_messaging_tab(self):
-        tk.Label(self.messaging_frame, text="Recipient username:").pack()
-        self.recipient_entry = tk.Entry(self.messaging_frame)
-        self.recipient_entry.pack(pady=5)
-
-        tk.Label(self.messaging_frame, text="Message:").pack()
-        self.msg_entry = tk.Text(self.messaging_frame, height=5, width=50)
-        self.msg_entry.pack(pady=5)
-
-        tk.Button(self.messaging_frame, text="Send", command=self.send_message_gui).pack(pady=5)
-        tk.Button(self.messaging_frame, text="Check Mailbox", command=self.refresh_inbox).pack(pady=5)
-
-        tk.Label(self.messaging_frame, text="Inbox:").pack()
-        self.inbox_text = tk.Text(self.messaging_frame, height=20, width=70)
-        self.inbox_text.pack(pady=5)
-
-    # ---------------- Messaging Functions ----------------
-    def send_message_gui(self):
+        def on_success(clients):
+            self.clients_text.delete("1.0", tk.END)
+            if clients:
+                for user in clients.keys(): self.clients_text.insert(tk.END, f"- {user}\n")
+            else:
+                self.clients_text.insert(tk.END, "No users registered.\n")
+        def on_error(error):
+            self.clients_text.delete("1.0", tk.END)
+            self.clients_text.insert(tk.END, f"Failed to fetch users: {error}\n")
+        self._execute_in_thread(self.api_client.get_clients, on_success, on_error)
+    def send_message(self):
         recipient = self.recipient_entry.get().strip()
-        if not recipient:
-            messagebox.showwarning("Warning", "Enter a recipient")
-            return
-        server_host = self.server_entry.get().strip()
-        server_url = f"http://{server_host}"
-
         message = self.msg_entry.get("1.0", tk.END).strip()
-        if not message:
-            messagebox.showwarning("Warning", "Message cannot be empty")
+        if not recipient or not message:
+            messagebox.showwarning("Input Required", "Recipient and message cannot be empty.")
             return
-
-        def send_thread():
-            try:
-                clients = requests.get(f"{server_url}/clients").json()
-                if recipient not in clients:
-                    self.inbox_text.insert(tk.END, f"Error: Recipient {recipient} not found\n")
-                    return
-                recipient_pub_bytes = base64.b64decode(clients[recipient])
-                message_bytes = message.encode()
-                signature = sign_message(self.private_key_bytes, message_bytes)
-                enc_key, enc_msg = encrypt_for_recipient(message_bytes, recipient_pub_bytes)
-                r = requests.post(f"{server_url}/send", json={
-                    "sender": self.username,
-                    "recipient": recipient,
-                    "encrypted_key": enc_key,
-                    "ciphertext": enc_msg,
-                    "signature": signature
-                }).json()
-                if r.get("status"):
-                    self.msg_entry.delete("1.0", tk.END)
-                    self.inbox_text.insert(tk.END, f"Message sent to {recipient}\n")
-                else:
-                    self.inbox_text.insert(tk.END, f"Error sending message: {r}\n")
-            except Exception as e:
-                self.inbox_text.insert(tk.END, f"Error sending message: {e}\n")
-
-        threading.Thread(target=send_thread, daemon=True).start()
-
+        def do_send():
+            clients = self.api_client.get_clients()
+            if recipient not in clients: raise ValueError(f"Recipient '{recipient}' not found on server.")
+            recipient_pub_bytes = base64.b64decode(clients[recipient])
+            message_bytes = message.encode()
+            signature = self.crypto.sign_message(self.private_key_bytes, message_bytes)
+            enc_key, enc_msg = self.crypto.encrypt_for_recipient(message_bytes, recipient_pub_bytes)
+            payload = {"sender": self.username, "recipient": recipient, "encrypted_key": enc_key, "ciphertext": enc_msg, "signature": signature}
+            return self.api_client.send_message(payload)
+        def on_success(result):
+            if result.get("status"):
+                self.msg_entry.delete("1.0", tk.END)
+                messagebox.showinfo("Success", f"Message sent to {recipient}!")
+            else:
+                messagebox.showerror("Send Error", f"Server error: {result}")
+        def on_error(error): messagebox.showerror("Send Error", str(error))
+        self._execute_in_thread(do_send, on_success, on_error)
     def refresh_inbox(self):
-        server_host = self.server_entry.get().strip()
-        server_url = f"http://{server_host}"
-
-        def fetch_thread():
-            try:
-                r = requests.get(f"{server_url}/inbox/{self.username}").json()
-                clients = requests.get(f"{server_url}/clients").json()
-                for msg in r:
+        def do_fetch():
+            messages = self.api_client.get_inbox(self.username)
+            clients = self.api_client.get_clients()
+            decrypted_messages = []
+            for msg in messages:
+                try:
                     sender = msg["sender"]
+                    if sender not in clients:
+                        decrypted_messages.append(f"From {sender}: <Sender public key not found>\n\n")
+                        continue
                     sender_pub_bytes = base64.b64decode(clients[sender])
-                    decrypted = decrypt_from_sender(msg["encrypted_key"], msg["ciphertext"], self.private_key_bytes)
-                    if verify_signature(sender_pub_bytes, decrypted, msg["signature"]):
-                        self.inbox_text.insert(tk.END, f"From {sender}: {decrypted.decode()}\n\n")
+                    decrypted_bytes = self.crypto.decrypt_from_sender(msg["encrypted_key"], msg["ciphertext"], self.private_key_bytes)
+                    if self.crypto.verify_signature(sender_pub_bytes, decrypted_bytes, msg["signature"]):
+                        decrypted_messages.append(f"From {sender}:\n{decrypted_bytes.decode()}\n\n")
                     else:
-                        self.inbox_text.insert(tk.END, f"From {sender}: <Invalid signature>\n\n")
-            except Exception as e:
-                self.inbox_text.insert(tk.END, f"Error checking mailbox: {e}\n")
-
-        threading.Thread(target=fetch_thread, daemon=True).start()
-
+                        decrypted_messages.append(f"From {sender}: <INVALID SIGNATURE>\n\n")
+                except Exception:
+                    decrypted_messages.append(f"From {msg.get('sender', 'Unknown')}: <DECRYPTION FAILED>\n\n")
+            return decrypted_messages
+        def on_success(messages):
+            self.inbox_text.delete("1.0", tk.END)
+            if messages:
+                for msg_text in messages: self.inbox_text.insert(tk.END, msg_text)
+            else:
+                self.inbox_text.insert(tk.END, "Your inbox is empty.\n")
+        def on_error(error): messagebox.showerror("Inbox Error", f"Could not fetch inbox: {error}")
+        self._execute_in_thread(do_fetch, on_success, on_error)
 
 if __name__ == "__main__":
     app = SecureApp()
